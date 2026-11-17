@@ -75,6 +75,15 @@ sudo apt-get install -y curl apt-transport-https gnupg2 software-properties-comm
 # Disable Swap
 
 sudo swapoff -a
+#####################################################
+## UUID=581a17c4-fc3a-400e-9bde-a1fdc8053c9f /               ext4    errors=remount-ro 0       1
+# /boot/efi was on /dev/sda2 during installation
+#UUID=6CBA-3E17  /boot/efi       vfat    umask=0077      0       1
+#/swapfile                                 none            swap    sw              0       0
+#/dev/fd0        /media/floppy0  auto    rw,user,noauto,exec,utf8 0       0
+##############################################################
+
+
 sudo sed -i '/ swap / s/^\(.*\)$/#\1/g' /etc/fstab
 
 # Remove or comment out swap entry in /etc/fstab to make the change permanent.
@@ -97,7 +106,7 @@ sudo apt-get install -y containerd.io
 # Configure Containerd
 sudo mkdir -p /etc/containerd
 containerd config default | sudo tee /etc/containerd/config.toml
-sudo sed -e 's/SystemdCgroup = false/SystemdCgroup = true/g' -i /etc/containerd/config.toml
+sudo sed -e 's/SystemdCgroup = false/SystemdCgroup = true/g' -i 
 sudo systemctl restart containerd
 sudo systemctl enable containerd
 
