@@ -119,7 +119,18 @@ restore-selinux-context() { # restore-selinux-context <path>...
 
 # ---- Downloads --------------------------------------------------------------
 download() { # download <url> <output-file>
+    
     wget -q --show-progress -O "$2" "$1"
+	rc=$?
+if [[ $rc -ne 0 ]]; then
+    echo "wget failed (exit $rc) for $1" >&2
+    # 8 = server issued an error response (e.g. 404, 500)
+    if [[ $rc -eq 8 ]]; then
+        echo "HTTP error (404/5xx) from $1; check other version" >&2
+    fi
+    exit $rc
+fi
+echo "download $1 done"
 }
 
 # download-verified <url> <output-file> <checksum-url>
@@ -215,8 +226,10 @@ configure-containerd() {
 # ---- runc -------------------------------------------------------------------
 setup-runc() {
     local base="https://github.com/opencontainers/runc/releases/download/v${RUNC_VERSION}"
+
     download-verified "${base}/runc.${ARCH}" "${WORKDIR}/runc.${ARCH}" "${base}/runc.sha256sum"
     sudo install -m 0755 "${WORKDIR}/runc.${ARCH}" "$RUNC_PATH"
+	sudo tar -C "$RUNC_PATH"-xzvf cni-plugins-linux-amd64-v1.4.1.tgz  --strip-components=1
     restore-selinux-context "$RUNC_PATH"
     echo "Installed: $("$RUNC_PATH" --version | head -n1)"
 }

@@ -74,3 +74,11 @@ sudo kubeadm reset
 
 
 journalctl -u kubelet -n 100 --no-pager
+
+{
+	ip -brief address
+ip route
+cat /etc/resolv.conf
+ping -4 1.1.1.1
+curl -4I http://archive.ubuntu.com/ubuntu/
+}
