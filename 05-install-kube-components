@@ -29,10 +29,44 @@ fi
 
 REPO_BASE="https://pkgs.k8s.io/core:/stable:/v${KUBE_VERSION}"
 
+# ---- Preflight --------------------------------------------------------------
+# Fail early, with the real reason, instead of a timeout several steps in. This also catches a
+# KUBE_VERSION that doesn't exist (the repo file returns 404).
+check-connectivity() { # check-connectivity <url>
+    local url="$1"
+    local -a probe
+    if command -v curl >/dev/null 2>&1; then
+        probe=(curl -4 -fsS -o /dev/null --max-time 10 "$url")
+    elif command -v wget >/dev/null 2>&1; then
+        probe=(wget -4 -q -O /dev/null --tries=1 --timeout=10 "$url")
+    else
+        return 0    # neither tool yet; the install step will fetch curl and fail loudly if offline
+    fi
+    if ! "${probe[@]}"; then
+        echo "ERROR: cannot reach ${url}" >&2
+        echo "  - Check internet access, DNS, proxy and firewall rules (outbound HTTPS to pkgs.k8s.io)." >&2
+        echo "  - If the network is fine, check that Kubernetes ${KUBE_VERSION} exists (setup.cfg: KUBE_VERSION)." >&2
+        exit 1
+    fi
+    echo "Repository reachable: ${url}"
+}
+
+# apt uses plain HTTP (port 80) for Ubuntu/Debian mirrors by default; some networks block it
+# while allowing HTTPS, so say how to fix that instead of just failing.
+apt-update() {
+    if ! sudo apt-get update; then
+        echo "ERROR: 'apt-get update' failed." >&2
+        echo "  If port 80 is blocked but HTTPS works, switch the mirrors to https, e.g.:" >&2
+        echo "    sudo sed -i 's|http://|https://|g' /etc/apt/sources.list.d/ubuntu.sources   # or /etc/apt/sources.list" >&2
+        exit 1
+    fi
+}
+
 # ---- Installers -------------------------------------------------------------
 install-debian() {
-    sudo apt-get update
-    sudo apt-get install -y apt-transport-https ca-certificates curl gnupg
+    apt-update
+    # (apt-transport-https is an obsolete empty stub: apt has supported HTTPS natively since 2017)
+    sudo apt-get install -y ca-certificates curl gnupg
 
     sudo mkdir -p -m 755 /etc/apt/keyrings
 
@@ -44,7 +78,7 @@ install-debian() {
     echo "deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.gpg] ${REPO_BASE}/deb/ /" \
         | sudo tee /etc/apt/sources.list.d/kubernetes.list >/dev/null
 
-    sudo apt-get update
+    apt-update
     sudo apt-get install -y --allow-change-held-packages kubelet kubeadm kubectl
     # Hold so a routine "apt upgrade" can't bump the cluster to a new version
     sudo apt-mark hold kubelet kubeadm kubectl
@@ -77,18 +111,27 @@ EOF
 }
 
 # ---- Main -------------------------------------------------------------------
-if [[ -f /etc/debian_version ]]; then
-    echo "Debian-based distribution detected"
-    install-debian
-elif [[ -f /etc/redhat-release ]]; then
-    echo "Red Hat-based distribution detected"
-    install-redhat
-else
-    echo "Unknown Linux distribution" >&2
-    exit 1
+main() {
+    if [[ -f /etc/debian_version ]]; then
+        echo "Debian-based distribution detected"
+        check-connectivity "${REPO_BASE}/deb/Release.key"
+        install-debian
+    elif [[ -f /etc/redhat-release ]]; then
+        echo "Red Hat-based distribution detected"
+        check-connectivity "${REPO_BASE}/rpm/repodata/repomd.xml.key"
+        install-redhat
+    else
+        echo "Unknown Linux distribution" >&2
+        exit 1
+    fi
+
+    # kubelet restarts in a crash loop until `kubeadm init/join` runs; that's expected.
+    sudo systemctl enable --now kubelet
+
+    echo "Installed: $(kubeadm version -o short), kubectl $(kubectl version --client -o yaml | grep gitVersion | head -n1 | awk '{print $2}')"
+}
+
+# Only run when executed directly (lets the functions be sourced for testing)
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+    main "$@"
 fi
-
-# kubelet restarts in a crash loop until `kubeadm init/join` runs; that's expected.
-sudo systemctl enable --now kubelet
-
-echo "Installed: $(kubeadm version -o short), kubectl $(kubectl version --client -o yaml | grep gitVersion | head -n1 | awk '{print $2}')"

@@ -82,3 +82,10 @@ cat /etc/resolv.conf
 ping -4 1.1.1.1
 curl -4I http://archive.ubuntu.com/ubuntu/
 }
+
+
+
+ping -c 2 1.1.1.1                                           # internet by IP address
+curl -4 -sS -I --max-time 10 https://pkgs.k8s.io | head -1  # HTTPS (what Kubernetes needs)
+curl -4 -sS -I --max-time 10 http://archive.ubuntu.com/ubuntu/ | head -1   # HTTP (what apt used)
+ip link show eth0 | grep -o 'mtu [0-9]*'
