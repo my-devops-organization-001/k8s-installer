@@ -24,7 +24,7 @@ validate-config() {
 
     # Report every missing value, then stop.
     local missing=0 var
-    for var in CONTAINERD_VERSION RUNC_VERSION CNI_VERSION KUBE_VERSION; do
+    for var in CONTAINERD_VERSION RUNC_VERSION CNI_VERSION KUBE_VERSION CILIUM_VERSION; do
         if [[ -z "${!var:-}" ]]; then
             echo "Ensure setup.cfg contains ${var}=<version>  (e.g. ${var}=1.2.3)" >&2
             missing=1
@@ -103,6 +103,15 @@ check-requirement() {
 }
 
 main() {
+    # Turn swap off now
+sudo swapoff -a
+
+# Comment out the swap line in /etc/fstab so it stays off after reboot
+sudo sed -i '/\sswap\s/s/^/#/' /etc/fstab
+
+# Verify
+free -h
+swapon --show    # should print nothing
     validate-config
     detect-os
     check-privileges

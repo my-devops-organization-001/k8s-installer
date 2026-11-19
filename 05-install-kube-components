@@ -54,6 +54,7 @@ check-connectivity() { # check-connectivity <url>
 # apt uses plain HTTP (port 80) for Ubuntu/Debian mirrors by default; some networks block it
 # while allowing HTTPS, so say how to fix that instead of just failing.
 apt-update() {
+     sudo sed -i 's|http://|https://|g' /etc/apt/sources.list.d/ubuntu.sources
     if ! sudo apt-get update; then
         echo "ERROR: 'apt-get update' failed." >&2
         echo "  If port 80 is blocked but HTTPS works, switch the mirrors to https, e.g.:" >&2
@@ -74,7 +75,7 @@ install-debian() {
     curl -fsSL "${REPO_BASE}/deb/Release.key" \
         | sudo gpg --dearmor --yes -o /etc/apt/keyrings/kubernetes-apt-keyring.gpg
     sudo chmod 644 /etc/apt/keyrings/kubernetes-apt-keyring.gpg
-
+     #This key is typically obtained by downloading Release.key from the Kubernetes repository and converting it to .gpg format via gpg --dearmor.
     echo "deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.gpg] ${REPO_BASE}/deb/ /" \
         | sudo tee /etc/apt/sources.list.d/kubernetes.list >/dev/null
 
