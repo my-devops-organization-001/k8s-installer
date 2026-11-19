@@ -118,19 +118,41 @@ restore-selinux-context() { # restore-selinux-context <path>...
 }
 
 # ---- Downloads --------------------------------------------------------------
+# Best-effort "HTTP/1.1 404 Not Found"-style line for a URL (only used to explain a failure).
+http-status() { # http-status <url>
+    wget --spider -S --tries=1 --timeout=10 "$1" 2>&1 \
+        | awk '/HTTP\//{line=$0} END{sub(/^[[:space:]]+/, "", line); print (line == "" ? "no response from server" : line)}'
+}
+
+# Downloads a file, or prints a clear error and stops the script.
+# NOTE: checking `$?` on the line after a bare `wget` does not work under `set -e`: the script
+# would already have exited before the message was printed. Capture the status with `|| rc=$?`.
 download() { # download <url> <output-file>
-    
-    wget -q --show-progress -O "$2" "$1"
-	rc=$?
-if [[ $rc -ne 0 ]]; then
-    echo "wget failed (exit $rc) for $1" >&2
-    # 8 = server issued an error response (e.g. 404, 500)
-    if [[ $rc -eq 8 ]]; then
-        echo "HTTP error (404/5xx) from $1; check other version" >&2
+    local url="$1" out="$2" rc=0
+
+    # --tries/--timeout: fail in seconds instead of retrying for many minutes (wget's default is 20 tries)
+    wget -q --show-progress --tries=3 --timeout=30 -O "$out" "$url" || rc=$?
+
+    if (( rc != 0 )); then
+        rm -f "$out"    # wget leaves an empty/partial file behind
+        echo "ERROR: download failed (wget exit code ${rc}): ${url}" >&2
+        case "$rc" in
+            3) echo "  Cannot write ${out}: check disk space and permissions." >&2 ;;
+            4) echo "  Network failure: check internet access, DNS or proxy settings." >&2 ;;
+            5) echo "  SSL/TLS verification failed: check the system clock and CA certificates." >&2 ;;
+            8) echo "  Server replied: $(http-status "$url")" >&2
+               echo "  The version in setup.cfg may not exist; check the project's releases page." >&2 ;;
+            *) echo "  See 'man wget' (EXIT STATUS) for the meaning of code ${rc}." >&2 ;;
+        esac
+        exit "$rc"
     fi
-    exit $rc
-fi
-echo "download $1 done"
+
+    if [[ ! -s "$out" ]]; then
+        rm -f "$out"
+        echo "ERROR: downloaded file is empty: ${url}" >&2
+        exit 1
+    fi
+    echo "download ${url} done"
 }
 
 # download-verified <url> <output-file> <checksum-url>
@@ -226,10 +248,8 @@ configure-containerd() {
 # ---- runc -------------------------------------------------------------------
 setup-runc() {
     local base="https://github.com/opencontainers/runc/releases/download/v${RUNC_VERSION}"
-
     download-verified "${base}/runc.${ARCH}" "${WORKDIR}/runc.${ARCH}" "${base}/runc.sha256sum"
     sudo install -m 0755 "${WORKDIR}/runc.${ARCH}" "$RUNC_PATH"
-	sudo tar -C "$RUNC_PATH"-xzvf cni-plugins-linux-amd64-v1.4.1.tgz  --strip-components=1
     restore-selinux-context "$RUNC_PATH"
     echo "Installed: $("$RUNC_PATH" --version | head -n1)"
 }
