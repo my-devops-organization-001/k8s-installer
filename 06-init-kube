@@ -1,48 +1,208 @@
 #!/usr/bin/env bash
+# Starts kubelet and initializes a Kubernetes control-plane node with kubeadm.
+# Works on Debian-based and Red Hat-based distributions.
+#
+# Optional settings (setup.cfg or environment):
+#   POD_CIDR=192.168.0.0/16                   # must NOT overlap your host/node network
+#   APISERVER_ADVERTISE_ADDRESS=10.0.0.5      # default: IP of the default-route interface
+#   CONTROL_PLANE_ENDPOINT=k8s.example.com:6443   # default: <advertise-ip>:6443 (use a DNS name/VIP for HA)
+#   CRI_SOCKET=unix:///run/containerd/containerd.sock
+set -euo pipefail
 
-start-kubelet(){
-    sudo systemctl start kubelet 
-    sudo systemctl enable kubelet 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=/dev/null
+[[ -f "${SCRIPT_DIR}/setup.cfg" ]] && source "${SCRIPT_DIR}/setup.cfg"
+
+OS_FAMILY=""      # debian | redhat
+PKG_MANAGER=""    # apt-get | dnf | yum
+
+POD_CIDR="${POD_CIDR:-192.168.0.0/16}"                      # Calico's default
+CRI_SOCKET="${CRI_SOCKET:-unix:///run/containerd/containerd.sock}"
+K8S_DIR="${K8S_DIR:-/etc/kubernetes}"
+
+# ---- OS detection -----------------------------------------------------------
+detect-os() {
+    if [[ -f /etc/debian_version ]]; then
+        OS_FAMILY="debian"
+        PKG_MANAGER="apt-get"
+        echo "Debian-based distribution detected"
+    elif [[ -f /etc/redhat-release ]]; then
+        OS_FAMILY="redhat"
+        PKG_MANAGER="yum"
+        command -v dnf >/dev/null 2>&1 && PKG_MANAGER="dnf"
+        echo "Red Hat-based distribution detected"
+    else
+        echo "Unknown Linux distribution (neither /etc/debian_version nor /etc/redhat-release found)" >&2
+        exit 1
+    fi
 }
 
-init-kubeadm(){
-
-read -p $'Do you want to reset this master node, type yes to reset it\n' IS_MASTER
-
-if [[ "$IS_MASTER" == "yes" ]];then
-    sudo kubeadm reset
-   
-fi
-
-# Get the IP address of the host
-host_ip=$(hostname -i | awk '{print $1}')
-
-# Check if the IP address is valid
-if [[ -z $host_ip ]]; then
-    echo "Error: Failed to retrieve host IP address."
-    exit 1
-fi
-
-# Initialize the Kubernetes control plane
-sudo kubeadm init --pod-network-cidr=192.168.0.0/16 --apiserver-advertise-address=$host_ip --control-plane-endpoint=$host_ip:6443
+pkg-install() { # pkg-install <package>...
+    case "$OS_FAMILY" in
+        debian) sudo apt-get update && sudo DEBIAN_FRONTEND=noninteractive apt-get install -y "$@" ;;
+        redhat) sudo "$PKG_MANAGER" install -y "$@" ;;
+    esac
 }
 
+# The "ip" command lives in iproute2 (Debian) / iproute (RHEL).
+ensure-tools() {
+    if ! command -v ip >/dev/null 2>&1; then
+        local pkg="iproute2"
+        [[ "$OS_FAMILY" == "redhat" ]] && pkg="iproute"
+        echo "Installing missing tool: ${pkg}"
+        pkg-install "$pkg"
+    fi
+}
 
-start-kubelet
+# ---- Checks -----------------------------------------------------------------
+check-kube-installed() {
+    local bin
+    for bin in kubeadm kubelet; do
+        if ! command -v "$bin" >/dev/null 2>&1; then
+            echo "${bin} not found. Run install-kube.sh first." >&2
+            exit 1
+        fi
+    done
+}
 
-read -p $'You need to start kubelet if not running, type yes to start it\n' IS_MASTER
+# kubeadm's official instructions require SELinux permissive on RHEL-family systems.
+check-selinux() {
+    if [[ "$OS_FAMILY" == "redhat" ]] && command -v getenforce >/dev/null 2>&1; then
+        if [[ "$(getenforce)" == "Enforcing" ]]; then
+            echo "SELinux is Enforcing. Run: sudo setenforce 0 && sudo sed -i 's/^SELINUX=enforcing\$/SELINUX=permissive/' /etc/selinux/config" >&2
+            exit 1
+        fi
+    fi
+}
 
-if [[ "$IS_MASTER" == "yes" ]];then
-   start-kubelet
-   
+node-initialized() {
+    [[ -f "${K8S_DIR}/admin.conf" || -f "${K8S_DIR}/manifests/kube-apiserver.yaml" ]]
+}
+
+# ---- IP helpers (pure bash, no extra tools) ---------------------------------
+ip-to-int() { # ip-to-int 10.1.2.3
+    local IFS=.
+    local -a o=($1)
+    echo $(( (o[0] << 24) + (o[1] << 16) + (o[2] << 8) + o[3] ))
+}
+
+ip-in-cidr() { # ip-in-cidr <ip> <a.b.c.d/len>   -> exit 0 if inside
+    local ip="$1" net="${2%/*}" bits="${2#*/}" mask
+    mask=$(( bits == 0 ? 0 : (0xFFFFFFFF << (32 - bits)) & 0xFFFFFFFF ))
+    (( ( $(ip-to-int "$ip") & mask ) == ( $(ip-to-int "$net") & mask ) ))
+}
+
+# `hostname -I` can return a docker bridge, a secondary NIC, or an IPv6 address first.
+# Ask the kernel which source address it would use to reach the internet instead.
+detect-host-ip() {
+    local ip=""
+    if command -v ip >/dev/null 2>&1; then
+        ip="$(ip -4 route get 1.1.1.1 2>/dev/null | awk '{for (i = 1; i <= NF; i++) if ($i == "src") {print $(i + 1); exit}}')"
+    fi
+    if [[ -z "$ip" ]]; then
+        ip="$(hostname -I 2>/dev/null | awk '{print $1}')"
+    fi
+    echo "$ip"
+}
+
+# ---- kubelet / reset / init -------------------------------------------------
+start-kubelet() {
+    # It will restart in a crash loop until `kubeadm init/join` runs. That is expected.
+    sudo systemctl enable --now kubelet
+}
+
+target-user() { echo "${SUDO_USER:-$(id -un)}"; }
+
+kube-home() { # home dir of the user who should get ~/.kube/config
+    echo "${KUBE_HOME:-$(getent passwd "$(target-user)" | cut -d: -f6)}"
+}
+
+reset-node() {
+    sudo kubeadm reset -f --cri-socket "$CRI_SOCKET"
+    # kubeadm reset leaves these behind; a stale CNI config or kubeconfig breaks the next init.
+    sudo rm -rf /etc/cni/net.d
+    rm -f "$(kube-home)/.kube/config"
+    echo "Node reset. (kubeadm does not clean iptables rules; flush them manually if needed.)"
+}
+
+setup-kubeconfig() {
+    local user home
+    user="$(target-user)"
+    home="$(kube-home)"
+    sudo mkdir -p "${home}/.kube"
+    sudo cp -f "${K8S_DIR}/admin.conf" "${home}/.kube/config"
+    sudo chown -R "${user}:$(id -gn "$user")" "${home}/.kube"
+    echo "kubectl configured for ${user} (${home}/.kube/config)"
+}
+
+init-kubeadm() {
+    local host_ip="${APISERVER_ADVERTISE_ADDRESS:-$(detect-host-ip)}"
+
+    if [[ ! "$host_ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+        echo "Error: could not determine a valid IPv4 address (got '${host_ip}'). Set APISERVER_ADVERTISE_ADDRESS." >&2
+        exit 1
+    fi
+    if [[ ! "$POD_CIDR" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+/[0-9]+$ ]]; then
+        echo "Error: POD_CIDR '${POD_CIDR}' is not a valid CIDR (e.g. 10.244.0.0/16)." >&2
+        exit 1
+    fi
+    # A pod CIDR that contains the node's own IP breaks routing. 192.168.0.0/16 (the default
+    # here) overlaps most home, lab and VM networks.
+    if ip-in-cidr "$host_ip" "$POD_CIDR"; then
+        echo "Error: node IP ${host_ip} is inside POD_CIDR ${POD_CIDR}." >&2
+        echo "Choose a non-overlapping range, e.g. POD_CIDR=10.244.0.0/16 in setup.cfg (match it in your CNI config)." >&2
+        exit 1
+    fi
+
+    local endpoint="${CONTROL_PLANE_ENDPOINT:-${host_ip}:6443}"
+    echo "Initializing control plane: advertise=${host_ip} endpoint=${endpoint} pod-cidr=${POD_CIDR}"
+
+    sudo kubeadm init \
+        --pod-network-cidr="$POD_CIDR" \
+        --apiserver-advertise-address="$host_ip" \
+        --control-plane-endpoint="$endpoint" \
+        --cri-socket "$CRI_SOCKET"
+
+    setup-kubeconfig
+
+    echo
+    echo "Next steps:"
+    echo "  1. Install a CNI add-on whose pod CIDR matches ${POD_CIDR} (e.g. Calico/Flannel)."
+    echo "  2. Join workers with:"
+    sudo kubeadm token create --print-join-command | sed 's/^/       /'
+}
+
+ask() { # ask <question>  -> exit 0 only if the answer is "yes"
+    local answer=""
+    read -rp "$1"$'\n' answer || answer=""
+    [[ "$answer" == "yes" ]]
+}
+
+main() {
+    detect-os
+    ensure-tools
+    check-kube-installed
+    check-selinux
+    start-kubelet
+
+    if ask 'Is this a control-plane (master) node? Type "yes" to initialize it'; then
+        if node-initialized; then
+            echo "This node already looks initialized (${K8S_DIR})."
+            if ask 'Reset it and start over? Type "yes" to reset (this destroys the cluster state on this node)'; then
+                reset-node
+            else
+                echo "Nothing to do."
+                return 0
+            fi
+        fi
+        init-kubeadm
+    else
+        echo "Worker node: run the 'kubeadm join ...' command printed by the control plane."
+        echo "Regenerate it there with: sudo kubeadm token create --print-join-command"
+    fi
+}
+
+# Only run when executed directly (lets the functions be sourced for testing)
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+    main "$@"
 fi
-
-sleep 3
-
-read -p $'is this your master, type yes to initialize it\n' IS_MASTER
-
-if [[ "$IS_MASTER" == "yes" ]];then
-    init-kubeadm
-   
-fi
-

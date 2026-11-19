@@ -1,63 +1,267 @@
 #!/usr/bin/env bash
-setup-containerd(){
-# Download the containerd archive
-wget https://github.com/containerd/containerd/releases/download/v1.7.14/containerd-1.7.14-linux-amd64.tar.gz
+# Installs containerd, runc and CNI plugins using the versions in setup.cfg.
+# Works on Debian-based and Red Hat-based distributions.
+#
+# setup.cfg example:
+#   CONTAINERD_VERSION=1.7.14
+#   RUNC_VERSION=1.1.12
+#   CNI_VERSION=1.4.1
+set -euo pipefail
 
-# Extract the archive to /usr/local
-sudo tar -C /usr/local -xzvf containerd-1.7.14-linux-amd64.tar.gz
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+CONFIG_FILE="${SCRIPT_DIR}/setup.cfg"
 
+OS_FAMILY=""      # debian | redhat
+PKG_MANAGER=""    # apt-get | dnf | yum
+ARCH=""
+WORKDIR=""
+
+# Install locations (overridable, e.g. for testing)
+CONTAINERD_PREFIX="${CONTAINERD_PREFIX:-/usr/local}"
+RUNC_PATH="${RUNC_PATH:-/usr/local/bin/runc}"
+CNI_DIR="${CNI_DIR:-/opt/cni/bin}"
+CONTAINERD_CONFIG="${CONTAINERD_CONFIG:-/etc/containerd/config.toml}"
+CONTAINERD_UNIT="${CONTAINERD_UNIT:-/etc/systemd/system/containerd.service}"
+
+# ---- Config -----------------------------------------------------------------
+validate-config() {
+    if [[ ! -f "$CONFIG_FILE" ]]; then
+        echo "Missing ${CONFIG_FILE}. Create it with CONTAINERD_VERSION, RUNC_VERSION and CNI_VERSION." >&2
+        exit 1
+    fi
+    # shellcheck source=/dev/null
+    source "$CONFIG_FILE"
+
+    local missing=0 var
+    for var in CONTAINERD_VERSION RUNC_VERSION CNI_VERSION; do
+        if [[ -z "${!var:-}" ]]; then
+            echo "Ensure setup.cfg contains ${var}=<x.y.z>  (e.g. ${var}=1.2.3)" >&2
+            missing=1
+        fi
+    done
+    (( missing == 0 )) || exit 1
+
+    # Accept "v1.2.3" as well as "1.2.3"
+    CONTAINERD_VERSION="${CONTAINERD_VERSION#v}"
+    RUNC_VERSION="${RUNC_VERSION#v}"
+    CNI_VERSION="${CNI_VERSION#v}"
 }
 
+# ---- OS / architecture ------------------------------------------------------
+detect-os() {
+    if [[ -f /etc/debian_version ]]; then
+        OS_FAMILY="debian"
+        PKG_MANAGER="apt-get"
+        echo "Debian-based distribution detected"
+    elif [[ -f /etc/redhat-release ]]; then
+        OS_FAMILY="redhat"
+        PKG_MANAGER="yum"
+        command -v dnf >/dev/null 2>&1 && PKG_MANAGER="dnf"
+        echo "Red Hat-based distribution detected"
+    else
+        echo "Unknown Linux distribution (neither /etc/debian_version nor /etc/redhat-release found)" >&2
+        exit 1
+    fi
+}
 
+detect-arch() {
+    case "$(uname -m)" in
+        x86_64)        ARCH=amd64 ;;
+        aarch64|arm64) ARCH=arm64 ;;
+        *) echo "Unsupported architecture: $(uname -m)" >&2; exit 1 ;;
+    esac
+}
+
+pkg-install() { # pkg-install <package>...
+    case "$OS_FAMILY" in
+        debian) sudo apt-get update && sudo DEBIAN_FRONTEND=noninteractive apt-get install -y "$@" ;;
+        redhat) sudo "$PKG_MANAGER" install -y "$@" ;;
+    esac
+}
+
+ensure-tools() {
+    local pkgs=() cmd
+    for cmd in wget tar; do
+        command -v "$cmd" >/dev/null 2>&1 || pkgs+=("$cmd")
+    done
+    if (( ${#pkgs[@]} > 0 )); then
+        echo "Installing missing tools: ${pkgs[*]}"
+        pkg-install "${pkgs[@]}"
+    fi
+}
+
+# Remove containerd installed from the distro/Docker repos so it can't clash with the
+# release binary. Note: on Debian, removing containerd.io also removes docker-ce (apt dependency).
+remove-packaged-containerd() {
+    local pkg
+    for pkg in containerd containerd.io; do
+        case "$OS_FAMILY" in
+            debian)
+                if dpkg -s "$pkg" >/dev/null 2>&1; then
+                    echo "Removing package ${pkg}"
+                    sudo apt-get remove -y "$pkg"
+                fi ;;
+            redhat)
+                if rpm -q "$pkg" >/dev/null 2>&1; then
+                    echo "Removing package ${pkg}"
+                    sudo "$PKG_MANAGER" remove -y "$pkg"
+                fi ;;
+        esac
+    done
+}
+
+# New binaries under SELinux (RHEL family) should get the default labels for their path.
+restore-selinux-context() { # restore-selinux-context <path>...
+    if [[ "$OS_FAMILY" == "redhat" ]] && command -v restorecon >/dev/null 2>&1; then
+        sudo restorecon -R "$@" 2>/dev/null || true
+    fi
+}
+
+# ---- Downloads --------------------------------------------------------------
+download() { # download <url> <output-file>
+    wget -q --show-progress -O "$2" "$1"
+}
+
+# download-verified <url> <output-file> <checksum-url>
+# Checksum files differ per project (one hash, or a list; runc's is PGP-signed text),
+# so find the line for this asset's name and compare.
+download-verified() {
+    local url="$1" out="$2" sum_url="$3" name expected actual
+    name="$(basename "$url")"
+    download "$url" "$out"
+    download "$sum_url" "${out}.sum"
+
+    expected="$(awk -v f="$name" '$2 == f || $2 == "*" f {print $1; exit}' "${out}.sum")"
+    if [[ -z "$expected" ]]; then
+        echo "No checksum for ${name} found in ${sum_url}" >&2
+        exit 1
+    fi
+    actual="$(sha256sum "$out" | awk '{print $1}')"
+    if [[ "$expected" != "$actual" ]]; then
+        echo "Checksum mismatch for ${name}!" >&2
+        echo "  expected: ${expected}" >&2
+        echo "  actual:   ${actual}" >&2
+        exit 1
+    fi
+    echo "Checksum OK: ${name}"
+}
+
+confirm() { # confirm <question>
+    local answer
+    read -rp "$1 Type \"yes\" to install: " answer
+    [[ "$answer" == "yes" ]]
+}
+
+# ---- containerd -------------------------------------------------------------
+setup-containerd() {
+    local was_active=0
+
+    if command -v containerd >/dev/null 2>&1; then
+        local current
+        current="$(containerd --version | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -n1 || true)"
+
+        if [[ -n "$current" ]]; then
+            # sort -V puts the lowest version first. If the wanted version sorts
+            # first (or is equal), the installed one is already new enough.
+            if [[ "$(printf '%s\n' "$CONTAINERD_VERSION" "$current" | sort -V | head -n1)" == "$CONTAINERD_VERSION" ]]; then
+                echo "containerd ${current} is already >= ${CONTAINERD_VERSION}; skipping."
+                return 0
+            fi
+            echo "Upgrading containerd ${current} -> ${CONTAINERD_VERSION}"
+        fi
+
+        if systemctl is-active --quiet containerd 2>/dev/null; then
+            was_active=1
+            sudo systemctl stop containerd
+        fi
+        remove-packaged-containerd
+    fi
+
+    local tarball="containerd-${CONTAINERD_VERSION}-linux-${ARCH}.tar.gz"
+    local base="https://github.com/containerd/containerd/releases/download/v${CONTAINERD_VERSION}"
+    download-verified "${base}/${tarball}" "${WORKDIR}/${tarball}" "${base}/${tarball}.sha256sum"
+    sudo mkdir -p "$CONTAINERD_PREFIX"
+    sudo tar -C "$CONTAINERD_PREFIX" -xzf "${WORKDIR}/${tarball}"
+    restore-selinux-context "${CONTAINERD_PREFIX}/bin"
+
+    # Bring a previously running containerd back up on the new binary
+    if (( was_active )); then
+        sudo systemctl daemon-reload
+        sudo systemctl start containerd
+    fi
+    echo "Installed: $("${CONTAINERD_PREFIX}/bin/containerd" --version)"
+}
+
+configure-containerd() {
+    # Config with the systemd cgroup driver (required by kubelet when using systemd)
+    sudo mkdir -p "$(dirname "$CONTAINERD_CONFIG")"
+    if [[ -f "$CONTAINERD_CONFIG" ]]; then
+        sudo cp "$CONTAINERD_CONFIG" "${CONTAINERD_CONFIG}.bak.$(date +%s)"
+    fi
+    "${CONTAINERD_PREFIX}/bin/containerd" config default | sudo tee "$CONTAINERD_CONFIG" >/dev/null
+    sudo sed -i 's/SystemdCgroup = false/SystemdCgroup = true/' "$CONTAINERD_CONFIG"
+    if ! grep -q 'SystemdCgroup = true' "$CONTAINERD_CONFIG"; then
+        echo "Warning: could not set SystemdCgroup = true in ${CONTAINERD_CONFIG}; check it manually." >&2
+    fi
+
+    # The tarball has no systemd unit, so install the official one. /etc/systemd/system is
+    # searched on every distro (/usr/local/lib/systemd/system is not guaranteed on RHEL).
+    download "https://raw.githubusercontent.com/containerd/containerd/v${CONTAINERD_VERSION}/containerd.service" "${WORKDIR}/containerd.service"
+    sudo install -m 0644 "${WORKDIR}/containerd.service" "$CONTAINERD_UNIT"
+    sudo systemctl daemon-reload
+    sudo systemctl enable --now containerd
+}
+
+# ---- runc -------------------------------------------------------------------
 setup-runc() {
-  # Download the runc binary
-	wget https://github.com/opencontainers/runc/releases/download/v1.1.12/runc.amd64
-
-	# Make the binary executable and move it to /usr/local/bin
-	chmod +x runc.amd64
-	sudo mv runc.amd64 /usr/local/bin/runc
+    local base="https://github.com/opencontainers/runc/releases/download/v${RUNC_VERSION}"
+    download-verified "${base}/runc.${ARCH}" "${WORKDIR}/runc.${ARCH}" "${base}/runc.sha256sum"
+    sudo install -m 0755 "${WORKDIR}/runc.${ARCH}" "$RUNC_PATH"
+    restore-selinux-context "$RUNC_PATH"
+    echo "Installed: $("$RUNC_PATH" --version | head -n1)"
 }
 
-
+# ---- CNI plugins ------------------------------------------------------------
 setup-container-network-interface() {
-    # Download and install CNI plugins
-    wget https://github.com/containernetworking/plugins/releases/download/v1.4.1/cni-plugins-linux-amd64-v1.4.1.tgz
-    sudo mkdir -p /opt/cni/bin
-    sudo tar -C /opt/cni/bin -xzvf cni-plugins-linux-amd64-v1.4.1.tgz  --strip-components=1 
+    local tarball="cni-plugins-linux-${ARCH}-v${CNI_VERSION}.tgz"
+    local base="https://github.com/containernetworking/plugins/releases/download/v${CNI_VERSION}"
+    download-verified "${base}/${tarball}" "${WORKDIR}/${tarball}" "${base}/${tarball}.sha256"
+    sudo mkdir -p "$CNI_DIR"
+    sudo tar -C "$CNI_DIR" -xzf "${WORKDIR}/${tarball}"
+    restore-selinux-context "$CNI_DIR"
+    echo "Installed CNI plugins in ${CNI_DIR}: $(ls "$CNI_DIR" | wc -l) files"
 }
 
+# ---- Main -------------------------------------------------------------------
+main() {
+    validate-config
+    detect-os
+    detect-arch
+    ensure-tools
 
-read -rp $'Install containerd? Type "yes" install\n' IS_MASTER
+    # Scratch dir for downloads, always cleaned up
+    WORKDIR="$(mktemp -d)"
+    trap 'rm -rf "$WORKDIR"' EXIT
 
-if [[ "$IS_MASTER" == "yes" ]]; then
-	setup-containerd
+    if confirm "Install containerd ${CONTAINERD_VERSION}?"; then
+        setup-containerd
+        if confirm "Write ${CONTAINERD_CONFIG} (SystemdCgroup = true) and enable the containerd service?"; then
+            configure-containerd
+        fi
+    fi
+
+    if confirm "Install runc ${RUNC_VERSION}?"; then
+        setup-runc
+    fi
+
+    if confirm "Install CNI plugins ${CNI_VERSION}?"; then
+        setup-container-network-interface
+    fi
+
+    echo "Done."
+}
+
+# Only run when executed directly (lets the functions be sourced for testing)
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+    main "$@"
 fi
-
-
-sleep 3
-
-
-
-read -rp $'Install runc? Type "yes" install\n' IS_MASTER
-
-if [[ "$IS_MASTER" == "yes" ]]; then
-	setup-runc
-fi
-
-sleep 3
-
-
-
-read -rp $'Install CNI? Type "yes" install\n' IS_MASTER
-
-if [[ "$IS_MASTER" == "yes" ]]; then
-	setup-container-network-interface
-fi
-
-#/etc/containerd/config.toml
-
-#To use the systemd cgroup driver in /etc/containerd/config.toml with runc, set
-
-#SystemdCgroup = true
-
-#To run containers in Pods, Kubernetes uses a container runtime.

@@ -1,35 +1,127 @@
 #!/usr/bin/env bash
+# CRI prerequisites: kernel modules + sysctl settings so the container runtime
+# and kube-proxy/CNI can see bridged traffic and forward packets.
+# (kubelet is the CRI client; containerd/CRI-O is the server, over a Unix socket.)
+set -euo pipefail
 
-setup-cri-requirement(){
-    #Forwarding IPv4 and letting iptables see bridged traffic
-    cat <<EOF | sudo tee /etc/modules-load.d/k8s.conf
-    overlay
-    br_netfilter
-EOF
+OS_FAMILY=""      # debian | redhat
+PKG_MANAGER=""    # apt-get | dnf | yum
 
-    sudo modprobe overlay
-    sudo modprobe br_netfilter
+# Overridable paths (handy for testing)
+MODULES_FILE="${MODULES_FILE:-/etc/modules-load.d/k8s.conf}"
+SYSCTL_FILE="${SYSCTL_FILE:-/etc/sysctl.d/k8s.conf}"
 
-    #sysctl params required by setup, params persist across reboots ; kernel param to perisit
+REQUIRED_MODULES=(overlay br_netfilter)
+REQUIRED_SYSCTLS=(
+    net.bridge.bridge-nf-call-iptables
+    net.bridge.bridge-nf-call-ip6tables
+    net.ipv4.ip_forward
+)
 
-    cat <<EOF | sudo tee /etc/sysctl.d/k8s.conf
-    net.bridge.bridge-nf-call-iptables  = 1
-    net.bridge.bridge-nf-call-ip6tables = 1
-    net.ipv4.ip_forward                 = 1
-EOF
-
-    #Apply sysctl params without reboot
-    sudo sysctl --system
-
-
-    # verify modules has been loaded 
-    lsmod | grep br_netfilter
-    lsmod | grep overlay
-    
-    #sysctl net.bridge.bridge-nf-call-iptables net.bridge.bridge-nf-call-ip6tables net.ipv4.ip_forward
-
-
-
+# ---- OS detection -----------------------------------------------------------
+detect-os() {
+    if [[ -f /etc/debian_version ]]; then
+        OS_FAMILY="debian"
+        PKG_MANAGER="apt-get"
+        echo "Debian-based distribution detected"
+    elif [[ -f /etc/redhat-release ]]; then
+        OS_FAMILY="redhat"
+        PKG_MANAGER="yum"
+        command -v dnf >/dev/null 2>&1 && PKG_MANAGER="dnf"
+        echo "Red Hat-based distribution detected"
+    else
+        echo "Unknown Linux distribution (neither /etc/debian_version nor /etc/redhat-release found)" >&2
+        exit 1
+    fi
 }
 
-setup-cri-requirement
+pkg-install() { # pkg-install <package>...
+    case "$OS_FAMILY" in
+        debian) sudo apt-get update && sudo DEBIAN_FRONTEND=noninteractive apt-get install -y "$@" ;;
+        redhat) sudo "$PKG_MANAGER" install -y "$@" ;;
+    esac
+}
+
+# modprobe/lsmod come from "kmod"; sysctl comes from "procps" (Debian) / "procps-ng" (RHEL).
+# Minimal/cloud images sometimes lack them.
+ensure-tools() {
+    local pkgs=()
+    command -v modprobe >/dev/null 2>&1 || pkgs+=(kmod)
+    if ! command -v sysctl >/dev/null 2>&1; then
+        [[ "$OS_FAMILY" == "debian" ]] && pkgs+=(procps) || pkgs+=(procps-ng)
+    fi
+    if (( ${#pkgs[@]} > 0 )); then
+        echo "Installing missing tools: ${pkgs[*]}"
+        pkg-install "${pkgs[@]}"
+    fi
+}
+
+# ---- Setup ------------------------------------------------------------------
+setup-cri-requirement() {
+    # Modules loaded at every boot. NOTE: heredoc bodies must start at column 0.
+    sudo tee "$MODULES_FILE" >/dev/null <<EOF
+overlay
+br_netfilter
+EOF
+
+    # Load them now too (no reboot needed)
+    local m
+    for m in "${REQUIRED_MODULES[@]}"; do
+        sudo modprobe "$m"
+    done
+
+    # Kernel params, persisted across reboots
+    sudo tee "$SYSCTL_FILE" >/dev/null <<EOF
+net.bridge.bridge-nf-call-iptables  = 1
+net.bridge.bridge-nf-call-ip6tables = 1
+net.ipv4.ip_forward                 = 1
+EOF
+
+    # Apply without reboot
+    sudo sysctl --system >/dev/null
+}
+
+# A module can be loaded, or compiled into the kernel (then it won't show in lsmod).
+module-available() {
+    lsmod | awk -v m="$1" '$1 == m {found = 1} END {exit !found}' \
+        || [[ -d "/sys/module/$1" ]] \
+        || grep -qE "/${1}\.ko" "/lib/modules/$(uname -r)/modules.builtin" 2>/dev/null
+}
+
+verify-cri-requirement() {
+    local failed=0 m key value
+
+    for m in "${REQUIRED_MODULES[@]}"; do
+        if module-available "$m"; then
+            echo "Module ${m}: OK"
+        else
+            echo "Module ${m}: NOT loaded" >&2; failed=1
+        fi
+    done
+
+    # Checks the *effective* value: another file in sysctl.d sorting after ours
+    # (e.g. 99-sysctl.conf) could override it.
+    for key in "${REQUIRED_SYSCTLS[@]}"; do
+        value="$(sysctl -n "$key" 2>/dev/null || echo "missing")"
+        if [[ "$value" == "1" ]]; then
+            echo "${key} = 1: OK"
+        else
+            echo "${key} = ${value} (expected 1)" >&2; failed=1
+        fi
+    done
+
+    return "$failed"
+}
+
+main() {
+    detect-os
+    ensure-tools
+    setup-cri-requirement
+    verify-cri-requirement
+    echo "CRI requirements configured"
+}
+
+# Only run when executed directly (lets the functions be sourced for testing)
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+    main "$@"
+fi

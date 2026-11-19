@@ -1,3 +1,13 @@
+# What is this this
+- These collection of script install and setup kubernetes with kubeadm
+# Usage
+- Before running ther script, ensure you set the version of the component to be install
+in ["04-runc-cni-conterd-install"](04-runc-cni-containerd-install)
+```bash
+./install
+```
+
+
 # This is a set of script that automate the deployment kubernetes using kubeadm
 - Start  install script and follow the prompt
 - once a master has been initialized, other once will join as worker

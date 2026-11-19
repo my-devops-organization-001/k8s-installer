@@ -1,54 +1,94 @@
 #!/usr/bin/env bash
+# Installs kubeadm, kubelet and kubectl from the official pkgs.k8s.io repos.
+#
+# Set the Kubernetes MINOR version either in setup.cfg or the environment:
+#   KUBE_VERSION=1.30
+set -euo pipefail
 
-install-kubeadm-kubeproxy-kubectl() {
-   
-    # Check if /etc/debian_version exists
-    if [ -f /etc/debian_version ]; then
-        echo "Debian-based distribution detected"
-        # Additional checks or actions for Debian-based systems can be added here
-        sudo apt-get update
-        sudo apt-get install -y apt-transport-https ca-certificates curl gnupg
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+if [[ -f "${SCRIPT_DIR}/setup.cfg" ]]; then
+    # shellcheck source=/dev/null
+    source "${SCRIPT_DIR}/setup.cfg"
+fi
 
-        # Ensure the keyring directory exists
-        sudo mkdir -p -m 755 /etc/apt/keyrings
+# ---- Validate KUBE_VERSION --------------------------------------------------
+if [[ -z "${KUBE_VERSION:-}" ]]; then
+    echo "KUBE_VERSION is not set. Add KUBE_VERSION=<major.minor> (e.g. 1.30) to setup.cfg or export it." >&2
+    exit 1
+fi
 
-        curl -fsSL https://pkgs.k8s.io/core:/stable:/v1.29/deb/Release.key | sudo gpg --dearmor -o /etc/apt/keyrings/kubernetes-apt-keyring.gpg
-        echo 'deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.gpg] https://pkgs.k8s.io/core:/stable:/v1.29/deb/ /' | sudo tee /etc/apt/sources.list.d/kubernetes.list
+KUBE_VERSION="${KUBE_VERSION#v}"   # accept "v1.30"
+if [[ "$KUBE_VERSION" =~ ^([0-9]+\.[0-9]+)\.[0-9]+$ ]]; then
+    # pkgs.k8s.io repos are per MINOR version, so 1.30.1 -> 1.30
+    echo "Note: repos are per minor version; using ${BASH_REMATCH[1]} instead of ${KUBE_VERSION}"
+    KUBE_VERSION="${BASH_REMATCH[1]}"
+elif [[ ! "$KUBE_VERSION" =~ ^[0-9]+\.[0-9]+$ ]]; then
+    echo "Invalid KUBE_VERSION '${KUBE_VERSION}'. Use major.minor, e.g. 1.30" >&2
+    exit 1
+fi
 
-        sudo apt-get update
-        #sudo apt-get install -y kubelet kubeadm kubectl
-        sudo apt-get -y install kubelet kubeadm kubectl --allow-change-held-packages
-        #sudo apt-get -y install kubelet=1.30.1-1.1 kubeadm=1.30.1-1.1 kubectl=1.30.1-1.1
-        sudo apt-mark hold kubelet kubeadm kubectl
+REPO_BASE="https://pkgs.k8s.io/core:/stable:/v${KUBE_VERSION}"
 
-    # Check if /etc/redhat-release exists
-    elif [ -f /etc/redhat-release ]; then
-        echo "Red Hat-based distribution detected"
-        # Additional checks or actions for Red Hat-based systems can be added here
-        # Set SELinux in permissive mode (effectively disabling it)
-        sudo setenforce 0
-        sudo sed -i 's/^SELINUX=enforcing$/SELINUX=permissive/' /etc/selinux/config
+# ---- Installers -------------------------------------------------------------
+install-debian() {
+    sudo apt-get update
+    sudo apt-get install -y apt-transport-https ca-certificates curl gnupg
 
-        # This overwrites any existing configuration in /etc/yum.repos.d/kubernetes.repo
-        cat <<EOF | sudo tee /etc/yum.repos.d/kubernetes.repo
-        [kubernetes]
-        name=Kubernetes
-        baseurl=https://pkgs.k8s.io/core:/stable:/v1.29/rpm/
-        enabled=1
-        gpgcheck=1
-        gpgkey=https://pkgs.k8s.io/core:/stable:/v1.29/rpm/repodata/repomd.xml.key
-        exclude=kubelet kubeadm kubectl cri-tools kubernetes-cni
-EOF
+    sudo mkdir -p -m 755 /etc/apt/keyrings
 
-        sudo yum install -y kubelet kubeadm kubectl --disableexcludes=kubernetes
-    else
-        # If neither file exists, the distribution couldn't be determined
-        echo "Unknown Linux distribution"
-        exit 1
-    fi 
+    # --yes lets the script be re-run without gpg stopping to ask about overwriting
+    curl -fsSL "${REPO_BASE}/deb/Release.key" \
+        | sudo gpg --dearmor --yes -o /etc/apt/keyrings/kubernetes-apt-keyring.gpg
+    sudo chmod 644 /etc/apt/keyrings/kubernetes-apt-keyring.gpg
+
+    echo "deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.gpg] ${REPO_BASE}/deb/ /" \
+        | sudo tee /etc/apt/sources.list.d/kubernetes.list >/dev/null
+
+    sudo apt-get update
+    sudo apt-get install -y --allow-change-held-packages kubelet kubeadm kubectl
+    # Hold so a routine "apt upgrade" can't bump the cluster to a new version
+    sudo apt-mark hold kubelet kubeadm kubectl
 }
 
-#install-kubeadm-kubeproxy-kubectl
+install-redhat() {
+    # Set SELinux to permissive (required by the official kubeadm instructions)
+    if command -v getenforce >/dev/null 2>&1 && [[ "$(getenforce)" == "Enforcing" ]]; then
+        sudo setenforce 0
+    fi
+    if [[ -f /etc/selinux/config ]]; then
+        sudo sed -i 's/^SELINUX=enforcing$/SELINUX=permissive/' /etc/selinux/config
+    fi
 
+    # NOTE: the heredoc body must start at column 0 -- indented INI keys break the repo file.
+    # This overwrites any existing /etc/yum.repos.d/kubernetes.repo.
+    sudo tee /etc/yum.repos.d/kubernetes.repo >/dev/null <<EOF
+[kubernetes]
+name=Kubernetes
+baseurl=${REPO_BASE}/rpm/
+enabled=1
+gpgcheck=1
+gpgkey=${REPO_BASE}/rpm/repodata/repomd.xml.key
+exclude=kubelet kubeadm kubectl cri-tools kubernetes-cni
+EOF
 
+    local pm=yum
+    command -v dnf >/dev/null 2>&1 && pm=dnf
+    sudo "$pm" install -y kubelet kubeadm kubectl --disableexcludes=kubernetes
+}
 
+# ---- Main -------------------------------------------------------------------
+if [[ -f /etc/debian_version ]]; then
+    echo "Debian-based distribution detected"
+    install-debian
+elif [[ -f /etc/redhat-release ]]; then
+    echo "Red Hat-based distribution detected"
+    install-redhat
+else
+    echo "Unknown Linux distribution" >&2
+    exit 1
+fi
+
+# kubelet restarts in a crash loop until `kubeadm init/join` runs; that's expected.
+sudo systemctl enable --now kubelet
+
+echo "Installed: $(kubeadm version -o short), kubectl $(kubectl version --client -o yaml | grep gitVersion | head -n1 | awk '{print $2}')"

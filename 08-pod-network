@@ -1,8 +1,257 @@
 #!/usr/bin/env bash
+# Installs the Cilium pod network on the control-plane node and waits until it is ready.
+# Works on Debian-based and Red Hat-based distributions.
+#
+# setup.cfg:
+#   CILIUM_VERSION=1.16.5     # required; pick one compatible with your Kubernetes version
+#   CILIUM_CLI_VERSION=v0.16.20  # optional; cilium-cli release (default: latest stable)
+#   POD_CIDR=10.244.0.0/16    # optional; must match `kubeadm init --pod-network-cidr`
+#                             # (default: auto-detected from the cluster). If the cluster has
+#                             # no podSubnet, Cilium's cluster-pool IPAM is used with this CIDR
+#                             # (or Cilium's own default when unset).
+set -euo pipefail
 
-set-pod-network(){
-sudo kubectl --kubeconfig=/etc/kubernetes/admin.conf create -f https://docs.projectcalico.org/manifests/calico.yaml
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+CONFIG_FILE="${SCRIPT_DIR}/setup.cfg"
+
+OS_FAMILY=""      # debian | redhat
+PKG_MANAGER=""    # apt-get | dnf | yum
+WORKDIR=""
+CLI_ARCH=""       # amd64 | arm64
+IPAM_SETS=()      # extra `--set` arguments for IPAM
+
+ADMIN_CONF="${ADMIN_CONF:-/etc/kubernetes/admin.conf}"
+SYSCTL_DIR="${SYSCTL_DIR:-/etc/sysctl.d}"
+CILIUM_BIN="${CILIUM_BIN:-/usr/local/bin/cilium}"
+ROLLOUT_TIMEOUT="${ROLLOUT_TIMEOUT:-300s}"
+
+# ---- Config -----------------------------------------------------------------
+load-config() {
+    if [[ ! -f "$CONFIG_FILE" && -z "${CILIUM_VERSION:-}" ]]; then
+        echo "Missing ${CONFIG_FILE}. Create it with CILIUM_VERSION=<x.y.z> (e.g. 1.16.5)." >&2
+        exit 1
+    fi
+    if [[ -f "$CONFIG_FILE" ]]; then
+        # shellcheck source=/dev/null
+        source "$CONFIG_FILE"
+    fi
+
+    if [[ -z "${CILIUM_VERSION:-}" ]]; then
+        echo "Ensure setup.cfg contains CILIUM_VERSION=<x.y.z>  (e.g. CILIUM_VERSION=1.16.5)" >&2
+        exit 1
+    fi
+    CILIUM_VERSION="${CILIUM_VERSION#v}"
+    if [[ ! "$CILIUM_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+        echo "Invalid CILIUM_VERSION '${CILIUM_VERSION}'. Use x.y.z, e.g. 1.16.5" >&2
+        exit 1
+    fi
+
+    if [[ -n "${CILIUM_CLI_VERSION:-}" ]]; then
+        CILIUM_CLI_VERSION="v${CILIUM_CLI_VERSION#v}"
+        if [[ ! "$CILIUM_CLI_VERSION" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "Invalid CILIUM_CLI_VERSION '${CILIUM_CLI_VERSION}'. Use vX.Y.Z, e.g. v0.16.20" >&2
+            exit 1
+        fi
+    fi
 }
-echo "installing pod Network Calico"
 
-set-pod-network
+# ---- OS detection -----------------------------------------------------------
+detect-os() {
+    if [[ -f /etc/debian_version ]]; then
+        OS_FAMILY="debian"
+        PKG_MANAGER="apt-get"
+        echo "Debian-based distribution detected"
+    elif [[ -f /etc/redhat-release ]]; then
+        OS_FAMILY="redhat"
+        PKG_MANAGER="yum"
+        command -v dnf >/dev/null 2>&1 && PKG_MANAGER="dnf"
+        echo "Red Hat-based distribution detected"
+    else
+        echo "Unknown Linux distribution (neither /etc/debian_version nor /etc/redhat-release found)" >&2
+        exit 1
+    fi
+
+    case "$(uname -m)" in
+        x86_64|amd64)  CLI_ARCH="amd64" ;;
+        aarch64|arm64) CLI_ARCH="arm64" ;;
+        *) echo "Unsupported architecture: $(uname -m)" >&2; exit 1 ;;
+    esac
+}
+
+pkg-install() { # pkg-install <package>...
+    case "$OS_FAMILY" in
+        debian) sudo apt-get update && sudo DEBIAN_FRONTEND=noninteractive apt-get install -y "$@" ;;
+        redhat) sudo "$PKG_MANAGER" install -y "$@" ;;
+    esac
+}
+
+ensure-tools() {
+    local tool
+    for tool in curl tar; do
+        if ! command -v "$tool" >/dev/null 2>&1; then
+            echo "Installing missing tool: ${tool}"
+            pkg-install "$tool"
+        fi
+    done
+    if ! command -v sha256sum >/dev/null 2>&1; then
+        echo "sha256sum not found (coreutils)." >&2
+        exit 1
+    fi
+}
+
+# Cilium needs a reasonably recent kernel (eBPF). Warn rather than fail: distro kernels backport.
+check-kernel() {
+    local kernel major minor
+    kernel="$(uname -r)"
+    major="${kernel%%.*}"
+    minor="${kernel#*.}"; minor="${minor%%.*}"
+    if [[ "$major" =~ ^[0-9]+$ && "$minor" =~ ^[0-9]+$ ]]; then
+        if (( major < 5 || (major == 5 && minor < 4) )); then
+            echo "Warning: kernel ${kernel} is older than 5.4; recent Cilium releases may not run on it." >&2
+        fi
+    fi
+}
+
+# On systemd >= 245 the default rp_filter can drop traffic on Cilium's lxc* interfaces.
+# Cilium's docs recommend overriding it for those interfaces.
+configure-sysctl() {
+    echo "Installing rp_filter override for Cilium interfaces"
+    sudo mkdir -p "$SYSCTL_DIR"
+    sudo tee "${SYSCTL_DIR}/99-override_cilium_rp_filter.conf" >/dev/null <<EOF
+net.ipv4.conf.lxc*.rp_filter = 0
+EOF
+    sudo systemctl restart systemd-sysctl 2>/dev/null || sudo sysctl --system >/dev/null
+}
+
+# ---- kubectl ----------------------------------------------------------------
+# admin.conf is readable by root only, hence sudo.
+kc() { sudo kubectl --kubeconfig="$ADMIN_CONF" "$@"; }
+cc() { sudo env KUBECONFIG="$ADMIN_CONF" "$CILIUM_BIN" "$@"; }
+
+check-prerequisites() {
+    if ! command -v kubectl >/dev/null 2>&1; then
+        echo "kubectl not found. Run install-kube.sh first." >&2
+        exit 1
+    fi
+    if ! sudo test -f "$ADMIN_CONF"; then
+        echo "${ADMIN_CONF} not found. Run this on the control-plane node after 'kubeadm init'." >&2
+        exit 1
+    fi
+    if ! kc get --raw /readyz >/dev/null 2>&1; then
+        echo "The Kubernetes API server is not answering yet. Wait a minute and retry." >&2
+        exit 1
+    fi
+}
+
+# The pod CIDR Cilium uses must equal the one given to `kubeadm init` (if any).
+cluster-pod-cidr() {
+    kc -n kube-system get configmap kubeadm-config -o jsonpath='{.data.ClusterConfiguration}' 2>/dev/null \
+        | awk '/podSubnet:/ {print $2; exit}' || true
+}
+
+# Decides how Cilium allocates pod IPs:
+#  - cluster has a podSubnet (kubeadm --pod-network-cidr): ipam.mode=kubernetes, so Cilium uses
+#    the per-node podCIDRs handed out by kube-controller-manager.
+#  - no podSubnet: Cilium's cluster-pool IPAM, with POD_CIDR if given.
+resolve-ipam() {
+    local cluster
+    cluster="$(cluster-pod-cidr)"
+
+    if [[ -n "${POD_CIDR:-}" && ! "$POD_CIDR" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+/[0-9]+$ ]]; then
+        echo "Unsupported POD_CIDR '${POD_CIDR}' (single IPv4 CIDR expected; use Helm values for dual-stack)." >&2
+        exit 1
+    fi
+
+    if [[ -n "$cluster" ]]; then
+        if [[ -n "${POD_CIDR:-}" && "$cluster" != "$POD_CIDR" ]]; then
+            echo "POD_CIDR (${POD_CIDR}) does not match the cluster's podSubnet (${cluster})." >&2
+            echo "Fix setup.cfg, or unset POD_CIDR to use the cluster's value." >&2
+            exit 1
+        fi
+        POD_CIDR="$cluster"
+        echo "Using the cluster's pod CIDR ${POD_CIDR} (Cilium ipam.mode=kubernetes)"
+        IPAM_SETS=(--set ipam.mode=kubernetes)
+    elif [[ -n "${POD_CIDR:-}" ]]; then
+        echo "Cluster has no podSubnet; using Cilium cluster-pool IPAM with ${POD_CIDR}"
+        IPAM_SETS=(--set ipam.mode=cluster-pool --set "ipam.operator.clusterPoolIPv4PodCIDRList=${POD_CIDR}")
+    else
+        echo "Cluster has no podSubnet and POD_CIDR is unset; using Cilium's default pool" >&2
+    fi
+}
+
+# ---- Cilium CLI -------------------------------------------------------------
+resolve-cli-version() {
+    if [[ -z "${CILIUM_CLI_VERSION:-}" ]]; then
+        CILIUM_CLI_VERSION="$(curl -fsSL https://raw.githubusercontent.com/cilium/cilium-cli/main/stable.txt)"
+        CILIUM_CLI_VERSION="${CILIUM_CLI_VERSION//[[:space:]]/}"
+        if [[ ! "$CILIUM_CLI_VERSION" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "Could not determine the latest cilium-cli version (got '${CILIUM_CLI_VERSION}')." >&2
+            echo "Set CILIUM_CLI_VERSION in setup.cfg." >&2
+            exit 1
+        fi
+    fi
+}
+
+install-cilium-cli() {
+    resolve-cli-version
+
+    if [[ -x "$CILIUM_BIN" ]] && "$CILIUM_BIN" version --client 2>/dev/null | grep -qF "$CILIUM_CLI_VERSION"; then
+        echo "cilium-cli ${CILIUM_CLI_VERSION} already installed"
+        return 0
+    fi
+
+    local base="https://github.com/cilium/cilium-cli/releases/download/${CILIUM_CLI_VERSION}"
+    local tarball="cilium-linux-${CLI_ARCH}.tar.gz"
+    echo "Installing cilium-cli ${CILIUM_CLI_VERSION} (${CLI_ARCH})"
+
+    curl -fsSL -o "${WORKDIR}/${tarball}" "${base}/${tarball}"
+    curl -fsSL -o "${WORKDIR}/${tarball}.sha256sum" "${base}/${tarball}.sha256sum"
+    (cd "$WORKDIR" && sha256sum --check "${tarball}.sha256sum")
+    sudo tar -xzf "${WORKDIR}/${tarball}" -C "$(dirname "$CILIUM_BIN")" cilium
+}
+
+# ---- Cilium -----------------------------------------------------------------
+# Pinned to a version so two runs always install the same release.
+set-pod-network() {
+    local args=(--version "$CILIUM_VERSION")
+    args+=("${IPAM_SETS[@]+"${IPAM_SETS[@]}"}")
+
+    # install the first time, upgrade on re-runs, so the script is safe to repeat
+    if kc -n kube-system get daemonset cilium >/dev/null 2>&1; then
+        echo "Cilium already present: upgrading to v${CILIUM_VERSION}"
+        cc upgrade "${args[@]}"
+    else
+        echo "Installing pod network Cilium v${CILIUM_VERSION}"
+        cc install "${args[@]}"
+    fi
+}
+
+wait-for-cilium() {
+    echo "Waiting for Cilium to become ready (timeout ${ROLLOUT_TIMEOUT})..."
+    cc status --wait --wait-duration "$ROLLOUT_TIMEOUT"
+    kc wait --for=condition=Ready nodes --all --timeout="$ROLLOUT_TIMEOUT"
+    kc get nodes
+}
+
+main() {
+    load-config
+    detect-os
+    ensure-tools
+    check-kernel
+    check-prerequisites
+    resolve-ipam
+    configure-sysctl
+
+    WORKDIR="$(mktemp -d)"
+    trap 'rm -rf "$WORKDIR"' EXIT
+
+    install-cilium-cli
+    set-pod-network
+    wait-for-cilium
+    echo "Cilium installed. Nodes are Ready."
+}
+
+# Only run when executed directly (lets the functions be sourced for testing)
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+    main "$@"
+fi

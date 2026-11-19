@@ -1,106 +1,182 @@
-#!/bin/env bash
+#!/usr/bin/env bash
+# Prepares a node for Kubernetes: pauses auto-updates, handles the OS firewall,
+# opens the required ports with iptables (persistently), and disables swap.
+set -euo pipefail
 
-# Get the process ID (PID) of the unattended-upgrades process
-PR=$(sudo ps aux | grep '[u]nattended-upgr' | awk '{print $2}')
+OS_FAMILY=""      # debian | redhat
+PKG_MANAGER=""    # apt-get | dnf | yum
+FSTAB="${FSTAB:-/etc/fstab}"
 
-# Check if the PID is greater than 0 (process exists)
-if [[ -n "$PR" ]]; then
-    # Kill the process using SIGKILL (-9)
-    sudo kill -9 "$PR"
-    echo "Process $PR killed."
-else
-    echo "No unattended-upgrades process found."
-fi
+# https://kubernetes.io/docs/reference/networking/ports-and-protocols/
+CONTROL_PLANE_PORTS=(
+    6443         # kube-apiserver
+    2379:2380    # etcd server client API
+    10250        # kubelet API
+    10257        # kube-controller-manager
+    10259        # kube-scheduler
+)
+WORKER_PORTS=(
+    10250        # kubelet API
+    30000:32767  # NodePort services
+)
+# Not opened on purpose: 10255 (kubelet read-only port) is disabled by default and
+# exposes pod/node info unauthenticated. 10251/10252 were removed in Kubernetes 1.22+.
+# Your CNI plugin needs its own ports too (e.g. Calico 179/tcp + 4789/udp, Flannel 8472/udp).
 
-                                      
-# check firwall
-firew="$(sudo iptables --version | awk '{print $1" version " $2}')"
-
-if [ ! -z "$firew" ]; then
-    echo "$firew detected"
-else
-    echo "Firewall iptables not detected"
-    exit 1
-fi
-
-master-port() {
-
-    # Allow incoming traffic on port 6443 (API)
-    sudo iptables -A INPUT -p tcp --dport 6443 -j ACCEPT
-
-    # Allow incoming traffic on ports 2379-2380 (ETCD)
-    sudo iptables -A INPUT -p tcp --dport 2379:2380 -j ACCEPT
-
-    # Allow incoming traffic on port 10250 (kubelet API)
-    sudo iptables -A INPUT -p tcp --dport 10250 -j ACCEPT
-
-    # Allow incoming traffic on port 10251 (Scheduler)
-    sudo iptables -A INPUT -p tcp --dport 10251 -j ACCEPT
-
-    # Allow incoming traffic on port 10252 (Controller API)
-    sudo iptables -A INPUT -p tcp --dport 10252 -j ACCEPT
-
-    # Allow incoming traffic on port 10255 (kubectl API)
-    sudo iptables -A INPUT -p tcp --dport 10255 -j ACCEPT
+# ---- OS detection -----------------------------------------------------------
+detect-os() {
+    if [[ -f /etc/debian_version ]]; then
+        OS_FAMILY="debian"
+        PKG_MANAGER="apt-get"
+        echo "Debian-based distribution detected"
+    elif [[ -f /etc/redhat-release ]]; then
+        OS_FAMILY="redhat"
+        PKG_MANAGER="yum"
+        command -v dnf >/dev/null 2>&1 && PKG_MANAGER="dnf"
+        echo "Red Hat-based distribution detected"
+    else
+        echo "Unknown Linux distribution (neither /etc/debian_version nor /etc/redhat-release found)" >&2
+        exit 1
+    fi
 }
 
-worker-port() {
-    # Allow incoming traffic on port 10255 (kubectl API)
-    sudo iptables -A INPUT -p tcp --dport 10255 -j ACCEPT
-
-    # Allow incoming traffic on port 10255 (Service port)
-    sudo iptables -A INPUT -p tcp --dport 30000:32767 -j ACCEPT 
+pkg-install() { # pkg-install <package>...
+    case "$OS_FAMILY" in
+        debian) sudo apt-get update && sudo DEBIAN_FRONTEND=noninteractive apt-get install -y "$@" ;;
+        redhat) sudo "$PKG_MANAGER" install -y "$@" ;;
+    esac
 }
 
-
-
-check-port(){
-    
-
-read -rp $'Is this your master? Type "yes" to open port\n' IS_MASTER
-
-port=""
-
-if [[ "$IS_MASTER" == "yes" ]]; then
-    port="6443"
-    # Call the master-port function if defined
-    master-port
-else
-    port="10255"
-    # Call the worker-port function if defined
-    worker-port
-fi
-
-# Define the host and port to check
-host=$(hostname -i | awk '{print $1}')
-
-# Check if the port is open
-if nc -zv "$host" "$port" &> /dev/null; then
-    echo "Port $port is open"
-else
-    echo "Port $port is closed"
-    echo "Opening port $port..."
-    # Open the port using netcat
-    nc -l -p "$port" &
-fi
-
-
-
-
-if [ -f /etc/debian_version ]; then
-    sudo ufw disable
-    echo "Debian-based distribution detected, ufw disabled"
-elif [ -f /etc/redhat-release ]; then 
-    sudo systemctl stop firewalld
-    sudo systemctl disable firewalld
-else
-    echo "Invalid OS type"
-fi
-
-
-sudo swapoff -a
-
+# ---- Automatic updates (they hold the package manager lock) -----------------
+stop-auto-updates() {
+    case "$OS_FAMILY" in
+        debian)
+            # Stop gracefully. SIGKILL (kill -9) in the middle of a dpkg run can leave
+            # the package database half-configured.
+            if systemctl is-active --quiet unattended-upgrades; then
+                echo "Stopping unattended-upgrades..."
+                sudo systemctl stop unattended-upgrades
+            fi
+            local waited=0
+            while pgrep -f unattended-upgr >/dev/null 2>&1; do
+                if (( waited >= 120 )); then
+                    echo "unattended-upgrades is still running after 120s; wait for it to finish and re-run." >&2
+                    exit 1
+                fi
+                echo "Waiting for unattended-upgrades to finish..."
+                sleep 5; waited=$(( waited + 5 ))
+            done
+            echo "No unattended-upgrades process running."
+            ;;
+        redhat)
+            local unit
+            for unit in dnf-automatic.timer dnf-automatic-install.timer dnf-automatic-download.timer \
+                        dnf-automatic-notifyonly.timer yum-cron.service packagekit.service; do
+                if systemctl is-active --quiet "$unit"; then
+                    echo "Stopping ${unit}..."
+                    sudo systemctl stop "$unit"
+                fi
+            done
+            ;;
+    esac
 }
 
-check-port
+# ---- Firewall ---------------------------------------------------------------
+ensure-iptables() {
+    if ! command -v iptables >/dev/null 2>&1; then
+        echo "iptables not found; installing..."
+        pkg-install iptables
+    fi
+    echo "$(sudo iptables --version | awk '{print $1" version "$2}') detected"
+}
 
+# ufw / firewalld would fight with the CNI and kube-proxy rules, so turn them off
+# BEFORE adding our own iptables rules (disabling ufw afterwards can drop them).
+disable-os-firewall() {
+    case "$OS_FAMILY" in
+        debian)
+            if command -v ufw >/dev/null 2>&1; then
+                sudo ufw disable
+                echo "ufw disabled"
+            else
+                echo "ufw not installed; nothing to disable"
+            fi
+            ;;
+        redhat)
+            if systemctl cat firewalld.service >/dev/null 2>&1; then
+                sudo systemctl disable --now firewalld
+                echo "firewalld stopped and disabled"
+            else
+                echo "firewalld not installed; nothing to disable"
+            fi
+            ;;
+    esac
+}
+
+# Idempotent, and inserted at the TOP of the chain: a plain "-A" lands after any
+# existing REJECT/DROP rule (common on cloud images) and would never match.
+open-ports() { # open-ports <port|from:to>...
+    local port
+    for port in "$@"; do
+        if sudo iptables -C INPUT -p tcp --dport "$port" -j ACCEPT 2>/dev/null; then
+            echo "Port ${port}/tcp already open"
+        else
+            sudo iptables -I INPUT -p tcp --dport "$port" -j ACCEPT
+            echo "Port ${port}/tcp opened"
+        fi
+    done
+}
+
+# iptables rules vanish on reboot unless saved.
+# Run this BEFORE the cluster exists: saving later would also snapshot kube-proxy/CNI chains.
+persist-iptables() {
+    case "$OS_FAMILY" in
+        debian)
+            pkg-install iptables-persistent
+            sudo netfilter-persistent save
+            ;;
+        redhat)
+            pkg-install iptables-services
+            sudo mkdir -p /etc/sysconfig
+            sudo iptables-save | sudo tee /etc/sysconfig/iptables >/dev/null
+            sudo systemctl enable iptables
+            ;;
+    esac
+    echo "iptables rules saved for reboot"
+}
+
+# ---- Swap (kubelet refuses to start with swap on by default) ----------------
+disable-swap() {
+    sudo swapoff -a
+    if [[ -f "$FSTAB" ]]; then
+        # Comment out active swap entries only (not already-commented ones); keep a backup.
+        sudo sed -i.bak -E '/^[^#].*[[:space:]]swap[[:space:]]/ s/^/#/' "$FSTAB"
+    fi
+    echo "Swap disabled"
+}
+
+# ---- Main -------------------------------------------------------------------
+main() {
+    local answer=""
+
+    detect-os
+    stop-auto-updates
+    ensure-iptables
+    disable-os-firewall
+
+    read -rp $'Is this a control-plane (master) node? Type "yes" for control-plane, anything else for worker\n' answer || answer=""
+    if [[ "$answer" == "yes" ]]; then
+        open-ports "${CONTROL_PLANE_PORTS[@]}"
+    else
+        open-ports "${WORKER_PORTS[@]}"
+    fi
+
+    persist-iptables
+    disable-swap
+    echo "Node preparation complete"
+}
+
+# Only run when executed directly (lets the functions be sourced for testing)
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+    main "$@"
+fi

@@ -1,34 +1,149 @@
 #!/usr/bin/env bash
+# Gives root or a regular user access to the cluster (kubectl) after `kubeadm init`.
+# Works on Debian-based and Red Hat-based distributions.
+# Run on the control-plane node:  ./set-kubeconfig.sh
+set -euo pipefail
 
-set-user(){
-    echo "Setting up regular user..."
-        #To start using your cluster, you need to run the following as a regular user:
-  mkdir -p $HOME/.kube
-  sudo cp -i /etc/kubernetes/admin.conf $HOME/.kube/config
-  sudo chown $(id -u):$(id -g) $HOME/.kube/config
-  KUBECONFIG=$HOME/.kube/config
-  export KUBECONFIG=$HOME/.kube/config
-  export KUBECONFIG=/etc/kubernetes/admin.conf
+OS_FAMILY=""      # debian | redhat
 
+ADMIN_CONF="${ADMIN_CONF:-/etc/kubernetes/admin.conf}"
+RC_MARKER="# kubectl config (added by set-kubeconfig.sh)"
+
+# ---- OS detection -----------------------------------------------------------
+detect-os() {
+    if [[ -f /etc/debian_version ]]; then
+        OS_FAMILY="debian"
+        echo "Debian-based distribution detected"
+    elif [[ -f /etc/redhat-release ]]; then
+        OS_FAMILY="redhat"
+        echo "Red Hat-based distribution detected"
+    else
+        echo "Unknown Linux distribution (neither /etc/debian_version nor /etc/redhat-release found)" >&2
+        exit 1
+    fi
 }
 
-
-
-set-for-root-user()
-{
-  #Alternatively, if you are the root user, you can run:
-  export KUBECONFIG=/etc/kubernetes/admin.conf
+# Files copied into a home directory should carry that path's SELinux labels (RHEL family).
+restore-selinux-context() { # restore-selinux-context <path>...
+    if [[ "$OS_FAMILY" == "redhat" ]] && command -v restorecon >/dev/null 2>&1; then
+        sudo restorecon -R "$@" 2>/dev/null || true
+    fi
 }
 
+# ---- Checks -----------------------------------------------------------------
+check-prerequisites() {
+    if ! command -v kubectl >/dev/null 2>&1; then
+        echo "kubectl not found. Run install-kube.sh first." >&2
+        exit 1
+    fi
+    if ! sudo test -f "$ADMIN_CONF"; then
+        echo "${ADMIN_CONF} not found. Run this on the control-plane node after 'kubeadm init'" >&2
+        echo "(worker nodes don't have it; copy a kubeconfig from the control plane instead)." >&2
+        exit 1
+    fi
+}
 
-read -rp $'1. Use kubernetes as root\n2. Use kubernetes as regular user\n' IS_MASTER
+# ---- User helpers -----------------------------------------------------------
+user-field() { getent passwd "$1" | cut -d: -f"$2"; }              # 6 = home, 7 = shell
+user-home()  { echo "${TARGET_HOME:-$(user-field "$1" 6)}"; }
 
-if [[ "$IS_MASTER" == "1" ]];then
-    set-for-root-user
-   
-elif [[ "$IS_MASTER" == "2" ]];then
-    set-user
-   
-else 
-    echo "Invalid option"
+# Startup file for the user's login shell (bash/zsh work the same on both OS families).
+rc-file-for() { # rc-file-for <user>
+    local home; home="$(user-home "$1")"
+    case "$(basename "$(user-field "$1" 7)")" in
+        zsh)  echo "${home}/.zshrc" ;;
+        bash) echo "${home}/.bashrc" ;;
+        *)    echo "${home}/.profile" ;;
+    esac
+}
+
+run-as() { # run-as <user> <command>...
+    if [[ "$(id -un)" == "$1" ]]; then shift; "$@"; else sudo -u "$1" "${@:2}"; fi
+}
+
+choose-regular-user() {
+    local user="${TARGET_USER:-${SUDO_USER:-$(id -un)}}"
+    if [[ "$user" == "root" ]]; then
+        read -rp "Regular username to configure kubectl for: " user || user=""
+    fi
+    if [[ -z "$user" || "$user" == "root" ]] || ! id "$user" >/dev/null 2>&1; then
+        echo "Invalid user '${user}'." >&2
+        exit 1
+    fi
+    echo "$user"
+}
+
+# ---- Option 1: root ---------------------------------------------------------
+# A script cannot change its parent shell's environment, so an `export` here would vanish
+# when the script ends. Persist it in root's shell startup file instead (idempotent).
+set-for-root-user() {
+    local rc existed=1
+    rc="$(rc-file-for root)"
+    [[ -e "$rc" ]] || existed=0
+
+    if sudo grep -qsF "export KUBECONFIG=${ADMIN_CONF}" "$rc"; then
+        echo "KUBECONFIG already set in ${rc}"
+    else
+        printf '\n%s\nexport KUBECONFIG=%s\n' "$RC_MARKER" "$ADMIN_CONF" | sudo tee -a "$rc" >/dev/null
+        (( existed )) || sudo chown "root:$(id -gn root)" "$rc"
+        echo "Added KUBECONFIG=${ADMIN_CONF} to ${rc}"
+    fi
+
+    verify-access root "$ADMIN_CONF"
+    echo "Open a new root shell, or run now:  export KUBECONFIG=${ADMIN_CONF}"
+}
+
+# ---- Option 2: regular user -------------------------------------------------
+set-user() {
+    local user group home cfg backup
+    user="$(choose-regular-user)"
+    group="$(id -gn "$user")"
+    home="$(user-home "$user")"
+    cfg="${home}/.kube/config"
+
+    echo "Setting up kubectl for user '${user}'..."
+    sudo mkdir -p "${home}/.kube"
+
+    # Never silently destroy an existing kubeconfig (it may hold other clusters/contexts).
+    if sudo test -f "$cfg" && ! sudo cmp -s "$ADMIN_CONF" "$cfg"; then
+        backup="${cfg}.bak.$(date +%s)"
+        sudo cp -p "$cfg" "$backup"
+        echo "Existing config backed up to ${backup}"
+    fi
+
+    sudo install -m 600 -o "$user" -g "$group" "$ADMIN_CONF" "$cfg"
+    sudo chown -R "${user}:${group}" "${home}/.kube"
+    restore-selinux-context "${home}/.kube"
+
+    # kubectl reads ~/.kube/config by default, so no KUBECONFIG export is needed. (Pointing
+    # KUBECONFIG at admin.conf would break it: that file is readable by root only.)
+    verify-access "$user" "$cfg"
+    echo "Done. kubectl works for ${user} in any new shell."
+}
+
+verify-access() { # verify-access <user> <kubeconfig>
+    if run-as "$1" kubectl --kubeconfig "$2" get nodes; then
+        echo "Cluster access verified."
+    else
+        echo "Warning: kubectl could not reach the cluster yet. The API server may still be starting; retry in a minute." >&2
+    fi
+}
+
+main() {
+    detect-os
+    check-prerequisites
+
+    local choice=""
+    read -rp $'1. Use kubernetes as root\n2. Use kubernetes as regular user\nChoose [1/2]: ' choice || choice=""
+
+    case "$choice" in
+        1) set-for-root-user ;;
+        2) set-user ;;
+        *) echo "Invalid option" >&2; exit 1 ;;
+    esac
+}
+
+# Only run when executed directly (lets the functions be sourced for testing)
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+    main "$@"
 fi
